@@ -1,0 +1,363 @@
+#include "mpi.h"
+#include "parallel.h"
+#include <stdlib.h>
+#include <stdio.h>
+
+void Programm_Message(char *txt)
+/* produces a stderr text output  */
+
+{
+  int myrank;
+
+  MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+  fprintf(stderr,"-MESSAGE- P:%2d : %s\n",myrank,txt);
+  fflush(stdout);
+  fflush(stderr);
+}
+
+
+void Programm_Sync(char *txt)
+/* produces a stderr textoutput and synchronize all processes */
+
+{
+  int myrank;
+
+  MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  fprintf(stderr,"-MESSAGE- P:%2d : %s\n",myrank,txt);
+  fflush(stdout);
+  fflush(stderr);
+  MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
+void Programm_Stop(char *txt)
+/* all processes will produce a text output, be synchronized and finished */
+
+{
+  int myrank;
+
+  MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+  MPI_Barrier(MPI_COMM_WORLD);                           /* synchronize output */
+  fprintf(stderr,"-STOP- P:%2d : %s\n",myrank,txt);
+  fflush(stdout);
+  fflush(stderr);
+  MPI_Barrier(MPI_COMM_WORLD);
+  MPI_Finalize();
+  exit(1);
+}
+
+void init_parallel(int iproc,int jproc,int imax,int jmax,int myrank,int *il,int *ir,int *jb,int *jt,int *rank_l,int *rank_r,
+		   int *rank_b,int *rank_t,int *omg_i,int *omg_j,int num_proc){
+
+  /* int i_scale,j_scale; */
+  /*first step: define omg_i,j*/
+  *omg_j = myrank/iproc + 1;
+  *omg_i = myrank%iproc +1;
+
+  /* /\*second step: define il,ir,jb,jt*\/ */
+  /* i_scale = imax/iproc; */
+  /* j_scale = jmax/jproc; */
+  /* *il = ((*omg_i)-1)*i_scale + 1; */
+  /* *ir = (*omg_i)*i_scale; */
+  /* *jb = ((*omg_j)-1)*j_scale + 1; */
+  /* *jt = (*omg_j)*j_scale; */
+  /* second step: define il, ir, jb, jt --- revised for arbitrary cell num and pro num */
+  /* i_scale = imax/iproc; */
+  /* if (*omg_i==iproc) */
+  /*   i_scale = imax - (iproc-1)*imax/iproc; */
+  /* j_scale = jmax/jproc; */
+  /* if (*omg_j==jproc) */
+  /*   j_scale = jmax - (jproc-1)*jmax/jproc; */
+  *il = ((*omg_i)-1)*imax/iproc + 1;
+  *ir = (*omg_i)*imax/iproc;
+  if (*omg_i==iproc)
+    *ir = imax;
+  *jb = ((*omg_j)-1)*jmax/jproc + 1;
+  *jt = (*omg_j)*jmax/jproc;
+  if (*omg_j==jproc)
+    *jt = jmax;
+
+
+  /*third step: define rank_l,r,b,t*/
+  if(1==(*omg_i))
+    *rank_l = MPI_PROC_NULL;
+  else
+    *rank_l = myrank-1;
+
+  if(iproc==(*omg_i))
+    *rank_r =  MPI_PROC_NULL;
+  else
+    *rank_r = myrank+1;
+
+  if(1==(*omg_j))
+    *rank_b =  MPI_PROC_NULL;
+  else
+    *rank_b = myrank-iproc;
+
+  if(jproc==(*omg_j))
+    *rank_t =  MPI_PROC_NULL;
+  else
+    *rank_t = myrank+iproc;
+
+}
+
+void pressure_comm(double **P,int il,int ir,int jb,int jt,int rank_l,int rank_r,int rank_b,int rank_t,double *BufSend,
+		   double *BufRecv,MPI_Status *status,int chunk){
+
+  int i,j,k;
+  BufSend = (double *)malloc((jt-jb+1)*sizeof(double));
+  BufRecv = (double *)malloc((jt-jb+1)*sizeof(double));
+  /*left boundary exchange*/
+  for(j=jb,k=0; j<=jt; j++){
+    BufSend[k] = P[il][j];
+    k++;
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  /* MPI_Sendrecv(BufSend,jt-jb+1,MPI_DOUBLE,rank_l,10,BufRecv,jt-jb+1,MPI_DOUBLE,rank_r,10,MPI_COMM_WORLD,status); */
+  if(rank_l != MPI_PROC_NULL)
+    MPI_Send(BufSend,jt-jb+1,MPI_DOUBLE,rank_l,10,MPI_COMM_WORLD);
+  if(rank_r != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,jt-jb+1,MPI_DOUBLE,rank_r,10,MPI_COMM_WORLD,status);
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  if(rank_r != MPI_PROC_NULL){
+    for(j=jb,k=0; j<=jt; j++){
+      P[ir+1][j] = BufRecv[k];
+      k++;
+    }
+  }
+
+  /*right boundary exchange*/
+  for(j=jb,k=0; j<=jt; j++){
+    BufSend[k] = P[ir][j];
+    k++;
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  /* MPI_Sendrecv(BufSend,jt-jb+1,MPI_DOUBLE,rank_r,20,BufRecv,jt-jb+1,MPI_DOUBLE,rank_l,20,MPI_COMM_WORLD,status); */
+  if(rank_r != MPI_PROC_NULL)
+    MPI_Send(BufSend,jt-jb+1,MPI_DOUBLE,rank_r,20,MPI_COMM_WORLD);
+  if(rank_l != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,jt-jb+1,MPI_DOUBLE,rank_l,20,MPI_COMM_WORLD,status);
+
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  if(rank_l != MPI_PROC_NULL){
+    for(j=jb,k=0; j<=jt; j++){
+      P[il-1][j] = BufRecv[k];
+      k++;
+    }
+  }
+  free(BufSend);
+  free(BufRecv);
+  BufSend = NULL;
+  BufRecv = NULL;
+  BufSend = (double *)malloc((ir-il+1)*sizeof(double));
+  BufRecv = (double *)malloc((ir-il+1)*sizeof(double));
+
+  /*top boundary exchange*/
+  for(i=il,k=0; i<=ir; i++){
+    BufSend[k] = P[i][jt];
+    k++;
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  /* MPI_Sendrecv(BufSend,ir-il+1,MPI_DOUBLE,rank_t,30,BufRecv,ir-il+1,MPI_DOUBLE,rank_b,30,MPI_COMM_WORLD,status); */
+  if(rank_t != MPI_PROC_NULL)
+    MPI_Send(BufSend,ir-il+1,MPI_DOUBLE,rank_t,30,MPI_COMM_WORLD);
+  if(rank_b != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,ir-il+1,MPI_DOUBLE,rank_b,30,MPI_COMM_WORLD,status);
+
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  if(rank_b != MPI_PROC_NULL){
+    for(i=il,k=0; i<=ir; i++){
+      P[i][jb-1] = BufRecv[k];
+      k++;
+    }
+  }
+
+  /*bottom boundary exchange*/
+  for(i=il,k=0; i<=ir; i++){
+    BufSend[k] = P[i][jb];
+    k++;
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  /* MPI_Sendrecv(BufSend,ir-il+1,MPI_DOUBLE,rank_b,40,BufRecv,ir-il+1,MPI_DOUBLE,rank_t,40,MPI_COMM_WORLD,status); */
+  if(rank_b != MPI_PROC_NULL)
+    MPI_Send(BufSend,ir-il+1,MPI_DOUBLE,rank_b,40,MPI_COMM_WORLD);
+  if(rank_t != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,ir-il+1,MPI_DOUBLE,rank_t,40,MPI_COMM_WORLD,status);
+
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  if(rank_t != MPI_PROC_NULL){
+    for(i=il,k=0; i<=ir; i++){
+      P[i][jt+1] = BufRecv[k];
+      k++;
+    }
+  }
+  free(BufSend);
+  free(BufRecv);
+
+}
+
+void uv_comm(double **U,double **V,int il,int ir,int jb,int jt,int rank_l,int rank_r,int rank_b,int rank_t,double *BufSend,
+	     double *BufRecv,MPI_Status *status,int chunk){
+
+  int i, j, k;
+
+  BufSend = (double *)malloc((jt-jb+2)*sizeof(double));
+  BufRecv = (double *)malloc((jt-jb+2)*sizeof(double));
+
+  /*left boundary exchange U*/
+  for(j=jb,k=0;j<=jt;j++){
+    BufSend[k] = U[il][j];
+    k++;
+  }
+
+  if(rank_l != MPI_PROC_NULL)
+    MPI_Send(BufSend,jt-jb+1,MPI_DOUBLE,rank_l,40,MPI_COMM_WORLD);
+  if(rank_r != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,jt-jb+1,MPI_DOUBLE,rank_r,40,MPI_COMM_WORLD,status);
+  if(rank_r != MPI_PROC_NULL){
+    for(j=jb,k=0;j<=jt;j++){
+      U[ir+1][j] = BufRecv[k];
+      k++;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  /*right boundary exchange U*/
+  for(j=jb,k=0;j<=jt;j++){
+    BufSend[k] = U[ir-1][j];
+    k++;
+  }
+
+  if(rank_r != MPI_PROC_NULL)
+    MPI_Send(BufSend,jt-jb+1,MPI_DOUBLE,rank_r,40,MPI_COMM_WORLD);
+  if(rank_l != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,jt-jb+1,MPI_DOUBLE,rank_l,40,MPI_COMM_WORLD,status);
+  if(rank_l != MPI_PROC_NULL){
+    for(j=jb,k=0;j<=jt;j++){
+      U[il-2][j] = BufRecv[k];
+      k++;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+  /*left boundary exchange V*/
+  for(j=jb-1,k=0;j<=jt;j++){
+    BufSend[k] = V[il][j];
+    k++;
+  }
+
+  if(rank_l != MPI_PROC_NULL)
+    MPI_Send(BufSend,jt-jb+2,MPI_DOUBLE,rank_l,40,MPI_COMM_WORLD);
+  if(rank_r != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,jt-jb+2,MPI_DOUBLE,rank_r,40,MPI_COMM_WORLD,status);
+  if(rank_r != MPI_PROC_NULL){
+    for(j=jb-1,k=0;j<=jt;j++){
+      V[ir+1][j] = BufRecv[k];
+      k++;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+  /*right boundary exchange V*/
+  for(j=jb-1,k=0;j<=jt;j++){
+    BufSend[k] = V[ir][j];
+    k++;
+  }
+
+  if(rank_r != MPI_PROC_NULL)
+    MPI_Send(BufSend,jt-jb+2,MPI_DOUBLE,rank_r,40,MPI_COMM_WORLD);
+  if(rank_l != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,jt-jb+2,MPI_DOUBLE,rank_l,40,MPI_COMM_WORLD,status);
+  if(rank_l != MPI_PROC_NULL){
+    for(j=jb-1,k=0;j<=jt;j++){
+      V[il-1][j] = BufRecv[k];
+      k++;
+    }
+  }
+
+  free(BufSend);
+  free(BufRecv);
+  BufSend = (double *)malloc((ir-il+2)*sizeof(double));
+  BufRecv = (double *)malloc((ir-il+2)*sizeof(double));
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+  /*top boundary exchange U*/
+  for(i=il-1,k=0;i<=ir;i++){
+    BufSend[k] = U[i][jt];
+    k++;
+  }
+
+  if(rank_t != MPI_PROC_NULL)
+    MPI_Send(BufSend,ir-il+2,MPI_DOUBLE,rank_t,40,MPI_COMM_WORLD);
+  if(rank_b != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,ir-il+2,MPI_DOUBLE,rank_b,40,MPI_COMM_WORLD,status);
+  if(rank_b != MPI_PROC_NULL){
+    for(i=il-1,k=0;i<=ir;i++){
+      U[i][jb-1] = BufRecv[k];
+      k++;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+  /*bottom boundary exchange U*/
+  for(i=il-1,k=0;i<=ir;i++){
+    BufSend[k] = U[i][jb];
+    k++;
+  }
+
+  if(rank_b != MPI_PROC_NULL)
+    MPI_Send(BufSend,ir-il+2,MPI_DOUBLE,rank_b,40,MPI_COMM_WORLD);
+  if(rank_t != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,ir-il+2,MPI_DOUBLE,rank_t,40,MPI_COMM_WORLD,status);
+  if(rank_t != MPI_PROC_NULL){
+    for(i=il-1,k=0;i<=ir;i++){
+      U[i][jt+1] = BufRecv[k];
+      k++;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+  /*top boundary exchange V*/
+  for(i=il,k=0;i<=ir;i++){
+    BufSend[k] = V[i][jt-1];
+    k++;
+  }
+
+  if(rank_t != MPI_PROC_NULL)
+    MPI_Send(BufSend,ir-il+1,MPI_DOUBLE,rank_t,40,MPI_COMM_WORLD);
+  if(rank_b != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,ir-il+1,MPI_DOUBLE,rank_b,40,MPI_COMM_WORLD,status);
+  if(rank_b != MPI_PROC_NULL){
+    for(i=il,k=0;i<=ir;i++){
+      V[i][jb-2] = BufRecv[k];
+      k++;
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+  /*bottom boundary exchange V*/
+  for(i=il,k=0;i<=ir;i++){
+    BufSend[k] = V[i][jb];
+    k++;
+  }
+
+  if(rank_b != MPI_PROC_NULL)
+    MPI_Send(BufSend,ir-il+1,MPI_DOUBLE,rank_b,40,MPI_COMM_WORLD);
+  if(rank_t != MPI_PROC_NULL)
+    MPI_Recv(BufRecv,ir-il+1,MPI_DOUBLE,rank_t,40,MPI_COMM_WORLD,status);
+  if(rank_t != MPI_PROC_NULL){
+    for(i=il,k=0;i<=ir;i++){
+      V[i][jt+1] = BufRecv[k];
+      k++;
+    }
+  }
+  free(BufSend);
+  free(BufRecv);
+}
+
+
+
+
+
+
+
+

@@ -1,0 +1,205 @@
+#include "helper.h"
+#include "visual.h"
+#include "init.h"
+#include "uvp.h"
+#include "boundary_val.h"
+#include "sor.h"
+#include "parallel.h"
+#include <mpi.h>
+#include "time.h"
+
+
+/**
+ * The main operation reads the configuration file, initializes the scenario and
+ * contains the main loop. So here are the individual steps of the algorithm:
+ *
+ * - read the program configuration file using read_parameters()
+ * - set up the matrices (arrays) needed using the matrix() command
+ * - create the initial setup init_uvp(), init_flag(), output_uvp()
+ * - perform the main loop
+ * - trailer: destroy memory allocated and do some statistics
+ *
+ * The layout of the grid is decribed by the first figure below, the enumeration
+ * of the whole grid is given by the second figure. All the unknowns corresond
+ * to a two dimensional degree of freedom layout, so they are not stored in
+ * arrays, but in a matrix.
+ *
+ * @image html grid.jpg
+ *
+ * @image html whole-grid.jpg
+ *
+ * Within the main loop the following big steps are done (for some of the
+ * operations a definition is defined already within uvp.h):
+ *
+ * - calculate_dt() Determine the maximal time step size.
+ * - boundaryvalues() Set the boundary values for the next time step.
+ * - calculate_fg() Determine the values of F and G (diffusion and confection).
+ *   This is the right hand side of the pressure equation and used later on for
+ *   the time step transition.
+ * - calculate_rs()
+ * - Iterate the pressure poisson equation until the residual becomes smaller
+ *   than eps or the maximal number of iterations is performed. Within the
+ *   iteration loop the operation sor() is used.
+ * - calculate_uv() Calculate the velocity at the next time step.
+ */
+int main(int argn, char** args){
+  /* int get_para; */
+
+  const char *szFileName = "cavity100.dat";
+  const char *szProblem = "cavity100";
+
+  double Re;
+  double UI;
+  double VI;
+  double PI;
+  double GX;
+  double GY;
+  double t_end;
+  double xlength;
+  double ylength;
+  double dt;
+  double dx;
+  double dy;
+  int  imax;
+  int  jmax;
+  double alpha;
+  double omg;
+  double tau;
+  int  itermax;
+  double eps;
+  double dt_value;
+
+  int n = 0;
+  double t = 0;
+  /* double dt_value;  */
+  int it = 0;
+  double res;
+
+  double **U;
+  double **V;
+  double **P;
+  double **RS;
+  double **F, **G;
+  double *bufSend, *bufRecv;
+  /*MPI variables**/
+  int num_proc,myrank,iproc,jproc,il,ir,jb,jt,rank_l,rank_r,rank_b,rank_t,omg_i,omg_j;
+  MPI_Status status;
+  int chunk = 0;
+  clock_t start,finish;
+  double duration = 0.0;
+
+    
+  MPI_Init(&argn,&args);
+  MPI_Comm_size(MPI_COMM_WORLD,&num_proc);
+  MPI_Comm_rank(MPI_COMM_WORLD,&myrank);
+  start = clock();
+  read_parameters(szFileName, &Re, &UI, &VI, &PI, &GX, &GY,
+		  &t_end, &xlength, &ylength, &dt, &dx, &dy, &imax, &jmax, &alpha, &omg, &tau,
+		  &itermax, &eps, &dt_value,&iproc,&jproc);
+  MPI_Barrier(MPI_COMM_WORLD);
+  if (num_proc!=iproc*jproc)
+    {
+      printf("the number of the proc is not right!\n");
+      Programm_Stop("stop");
+    }
+  else
+    {
+ 
+   init_parallel(iproc,jproc,imax,jmax,myrank,&il,&ir,&jb,&jt,&rank_l,&rank_r,&rank_b,&rank_t,&omg_i,&omg_j,num_proc);
+   MPI_Barrier(MPI_COMM_WORLD);
+      /* allocate memory for the buffer */
+      if (ir-il+1>jt-jb+1)
+    {
+      bufSend = (double *) malloc( (ir-il+1) * sizeof(double) );
+      bufRecv = (double *) malloc( (ir-il+1) * sizeof(double) );
+    }
+  else
+    {
+      bufSend = (double *) malloc( (jt-jb+1) * sizeof(double) );
+      bufRecv = (double *) malloc( (jt-jb+1) * sizeof(double) );
+    }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  U = matrix(il-2,ir+1,jb-1,jt+1);
+  V = matrix(il-1,ir+1,jb-2,jt+1);
+  P = matrix(il-1,ir+1,jb-1,jt+1);
+  RS = matrix(il,ir,jb,jt);
+  F = matrix(il-2,ir+1,jb-1,jt+1);
+  G = matrix(il-1,ir+1,jb-2,jt+1);
+
+  init_uvp(UI, VI, PI,il,ir,jb,jt, U, V, P,rank_t);
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  while(t < t_end){
+
+    if(tau>=0){
+      calculate_dt(Re, tau, &dt, dx, dy,il,ir,jb,jt, U, V);
+    }
+    /* Programm_Sync("dt is calculated"); */
+    if(myrank==0) printf("value of dt:%f\n",dt);
+    boundaryvalues(imax,jmax,il,ir,jb,jt, U, V);
+    /* Programm_Sync("boundary is set"); */
+    MPI_Barrier(MPI_COMM_WORLD);
+    calculate_fg(Re, GX, GY, alpha, dt, dx, dy,il,ir,jb,jt,imax,jmax,U, V, F, G);
+    /* Programm_Sync("fg is calculated"); */
+    MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+    calculate_rs(dt, dx, dy, il,ir,jb,jt,F, G, RS);
+    /* Programm_Sync("rs is calculated"); */
+    MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+    
+    it = 0;
+    res=eps+1;
+    while(it<itermax  && res>eps){
+     
+      sor(omg, dx, dy,imax,jmax,il,ir,jb,jt,myrank,P, RS, &res);
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      pressure_comm(P,il,ir,jb,jt,rank_l,rank_r,rank_b,rank_t,bufSend,bufRecv,&status,chunk);
+      MPI_Barrier(MPI_COMM_WORLD);
+
+
+      it++;
+
+    }
+    /* Programm_Sync("sor is calculated"); */
+    MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+    calculate_uv(dt, dx, dy, il,ir,jb,jt, U, V, F, G, P);
+    /* Programm_Sync("uv is calculated"); */
+    MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+    uv_comm(U,V,il,ir,jb,jt,rank_l,rank_r,rank_b,rank_t,bufSend,bufRecv,&status,chunk);
+    /* Programm_Sync("uv is commed"); */
+    MPI_Barrier(MPI_COMM_WORLD);                             /* synchronize output */
+
+
+    if(n%5==0){
+      output_uvp(szProblem, n, xlength, ylength, imax, jmax, dx, dy, U, V, P,il,ir,jb,jt,myrank);
+      printf("\nfile number: %d\n", n+1);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    t += dt;
+    n++;
+  }
+
+ 
+  /* free matrix */
+  free_matrix(U,il-2,ir+1,jb-1,jt+1);
+  free_matrix(V,il-1,ir+1,jb-2,jt+1);
+  free_matrix(P,il-1,ir+1,jb-1,jt+1);
+  free_matrix(RS,il,ir,jb,jt);
+  free_matrix(F,il-2,ir+1,jb-1,jt+1);
+  free_matrix(G,il-1,ir+1,jb-2,jt+1);
+  MPI_Barrier(MPI_COMM_WORLD);
+  finish = clock();
+  duration = (double)(finish - start) / CLOCKS_PER_SEC;
+  if (myrank == 0) 
+    printf("the running time is %f seconds\n", duration);    
+  Programm_Stop("stop");
+    }
+  return -1;
+
+
+}
